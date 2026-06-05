@@ -1,0 +1,21 @@
+{
+  "@context": [
+    "https://www.w3.org/ns/did/v1",
+    "https://w3id.org/security/multikey/v1"
+  ],
+  "assertionMethod": [
+    "did:web:vantor.com#key-1"
+  ],
+  "authentication": [
+    "did:web:vantor.com#key-1"
+  ],
+  "id": "did:web:vantor.com",
+  "verificationMethod": [
+    {
+      "controller": "did:web:vantor.com",
+      "id": "did:web:vantor.com#key-1",
+      "publicKeyMultibase": "zUC7Ey1aPHVHktCNREuCK1X5ETQy5Yu54aRf39muZDEm3uvKhadQwkmmbqsqSa34mLkMQKwtifg6DKoUNwqFcwfQrts89UzZBNmtQyFhbyuPpqx3R7gJ7xuuygQ92tttHYGwAsA",
+      "type": "Multikey"
+    }
+  ]
+}

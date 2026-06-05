@@ -1,0 +1,34 @@
+{
+  "profile": "novi-gen2-obc-versal-ai-edge-a72",
+  "qemu": {
+    "system_binary": "qemu-system-aarch64",
+    "machine": "virt",
+    "cpu": "cortex-a72",
+    "smp": 2,
+    "memory": "1024M",
+    "console": "ttyAMA0",
+    "network": "none",
+    "host_share_tag": "hostshare"
+  },
+  "approximates": [
+    "NOVI LLC USA Gen 2 OBC AMD/Xilinx Versal AI Edge Series application processor path",
+    "Dual-core ARM Cortex-A72 running Linux userspace",
+    "Low-power profile by limiting QEMU to two A72 vCPUs and 1024M RAM"
+  ],
+  "not_emulated_by_qemu": [
+    "Dual-core ARM Cortex-R5F real-time subsystem",
+    "Programmable Logic FPGA fabric",
+    "AI Engines",
+    "Vorago ARM Cortex-M4 MCU",
+    "Embedded radiation-hardened FRAM behavior",
+    "SEL immunity",
+    "SEU/SEFI mitigation",
+    "ECC protected memory interfaces",
+    "Redundant boot image storage",
+    "Actual 0.75W to 50W power draw"
+  ],
+  "power_model": {
+    "low_power_mode_watts": "<0.75W platform assumption, not measured by QEMU",
+    "high_performance_mode_watts": "5-50W platform assumption, application dependent, not measured by QEMU"
+  }
+}
