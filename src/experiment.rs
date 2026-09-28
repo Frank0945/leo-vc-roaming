@@ -1,760 +1,332 @@
-use std::{
-    collections::HashSet,
-    path::PathBuf,
-    time::{SystemTime, UNIX_EPOCH},
-};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use serde::Serialize;
-use serde_json::json;
-use ssi_claims::{
-    VerificationParameters,
-    vc::v2::syntax::{JsonCredential, JsonPresentation},
-};
-use ssi_data_integrity::AnyDataIntegrity;
-use ssi_dids_core::{DIDBuf, VerificationMethodDIDResolver};
-use ssi_verification_methods::AnyMethod;
 
 use crate::{
-    did_cache::{OfflineDidResolver, did_web_document, public_key_multibase},
+    bbs_binding::{
+        Holder, Issuer, SubjectAttribute, VerifierRequest, blind_issue, present, verify,
+    },
     error::DynError,
-    fs_util::{ensure_dir, file_len, workspace_path, write_json, write_text},
-    metrics::{StageMetric, StageTimer},
-    model::{
-        CooperationAgreementSubject, LeoAuthorizationSubject, QemuProfile, RoamingContractSubject,
-        SubjectKeys, qemu_profile,
-    },
-    vc::{
-        derive_cooperation_agreement, derive_leo_authorization, derive_roaming_contract,
-        issue_bbs_vc, sign_holder_vp,
-    },
+    fs_util::{ensure_dir, workspace_path, write_json},
+    model::{CredentialKind, LEO_PARTNER, PARTNER_NCC, UE},
 };
 
 const RESULTS_ROOT: &str = "results";
-const DID_CACHE_ROOT: &str = "fixtures/did-cache";
+const MEASURED_RUNS: usize = 50;
+const FIGURE_5_ATTRIBUTE_COUNTS: [usize; 6] = [5, 6, 7, 8, 9, 10];
+const FIGURE_5_REVEAL_RATIO: f64 = 0.8;
+const FIGURE_6_ATTRIBUTE_COUNT: usize = 7;
+const FIGURE_6_REVEAL_RATIOS: [f64; 5] = [0.2, 0.4, 0.6, 0.8, 1.0];
+const FIGURE_7_ATTRIBUTE_COUNTS: [usize; 6] = [5, 6, 7, 8, 9, 10];
+const FIGURE_7_REVEAL_RATIO: f64 = 0.4;
+const WARM_UP_STAGE: &str = "Cryptographic initialization (warm-up)";
+const GENERATE_STAGE: &str = "Partner LEO Gen. VP for UE";
+const VERIFY_STAGE: &str = "Partner LEO Verify UE VP";
 
-#[derive(Debug)]
-struct ExperimentState {
-    run_id: String,
-    result_dir: PathBuf,
-    artifact_dir: PathBuf,
-    did_cache_dir: PathBuf,
-    metrics: Vec<StageMetric>,
-    seen_actors: HashSet<&'static str>,
-    process_cold_start_recorded: bool,
+#[derive(Debug, Clone)]
+struct Condition {
+    figure: &'static str,
+    attribute_count: usize,
+    target_reveal_ratio: f64,
 }
 
 #[derive(Debug, Clone, Serialize)]
-struct ExperimentSummary {
+#[serde(rename_all = "camelCase")]
+struct RawSample {
+    figure: String,
+    attribute_count: usize,
+    target_reveal_ratio: f64,
+    revealed_attribute_count: usize,
+    effective_reveal_ratio: f64,
+    iteration: usize,
+    stage: String,
+    wall_time_ms: f64,
+    vp_payload_bytes: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct Aggregate {
+    figure: String,
+    attribute_count: usize,
+    target_reveal_ratio: f64,
+    revealed_attribute_count: usize,
+    effective_reveal_ratio: f64,
+    measured_runs: usize,
+    mean_time_ms: f64,
+    p50_time_ms: f64,
+    p95_time_ms: f64,
+    mean_vp_payload_bytes: Option<f64>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct StageSummary {
+    stage: &'static str,
+    results: Vec<Aggregate>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct Summary {
     run_id: String,
-    qemu_profile: QemuProfile,
-    metrics: Vec<StageMetric>,
+    protocol: &'static str,
+    benchmark_reference: &'static str,
+    measured_runs_per_condition: usize,
+    stages: Vec<StageSummary>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ExcelInput<'a> {
+    run_id: &'a str,
+    figure5: Vec<Aggregate>,
+    figure6: Vec<Aggregate>,
+    figure7: Vec<Aggregate>,
+    raw_samples: &'a [RawSample],
+    summary: &'a Summary,
 }
 
 pub async fn run() -> Result<(), DynError> {
-    let mut state = ExperimentState::new()?;
+    let run_id = SystemTime::now()
+        .duration_since(UNIX_EPOCH)?
+        .as_secs()
+        .to_string();
+    let result_dir = workspace_path(&[RESULTS_ROOT, &format!("run-{run_id}")]);
+    ensure_dir(&result_dir)?;
+    let conditions = benchmark_conditions();
+    let mut raw_samples = Vec::new();
 
-    let mut stage = state.start_stage(
-        "bootstrap_runtime_cold_start",
-        "experiment_harness",
-        "bootstrap_runtime",
-    );
-    let _bootstrap_probe = serde_json::to_vec(&json!({
-        "bootstrap": true,
-        "profile": qemu_profile().intended_target,
-    }))?;
-    state.finish_stage(stage, 0);
+    for condition in &conditions {
+        run_condition(condition, &mut raw_samples)?;
+    }
 
-    stage = state.start_stage(
-        "initialize_spacex_operator_keys",
-        "spacex_operator",
-        "initialize_device_keys",
-    );
-    let spacex = SubjectKeys::new_bbs()?;
-    state.finish_stage(stage, 0);
-
-    stage = state.start_stage(
-        "initialize_vantor_operator_keys",
-        "vantor_operator",
-        "initialize_device_keys",
-    );
-    let vantor = SubjectKeys::new_bbs()?;
-    state.finish_stage(stage, 0);
-
-    stage = state.start_stage(
-        "initialize_user_device_keys",
-        "user_terminal",
-        "initialize_device_keys",
-    );
-    let user_issuer = SubjectKeys::new_bbs()?;
-    let user = SubjectKeys::new_ed25519()?;
-    state.finish_stage(stage, 0);
-
-    stage = state.start_stage(
-        "initialize_spacex_leo_keys",
-        "spacex_leo",
-        "initialize_device_keys",
-    );
-    let spacex_leo = SubjectKeys::new_ed25519()?;
-    state.finish_stage(stage, 0);
-
-    stage = state.start_stage(
-        "initialize_vantor_leo_keys",
-        "vantor_leo",
-        "initialize_device_keys",
-    );
-    let vantor_leo = SubjectKeys::new_ed25519()?;
-    state.finish_stage(stage, 0);
-
-    stage = state.start_stage("load_did_cache", "experiment_harness", "load_did_cache");
-    let spacex_did: DIDBuf = "did:web:spacex.com".parse()?;
-    let vantor_did: DIDBuf = "did:web:vantor.com".parse()?;
-
-    let spacex_doc = did_web_document(spacex_did.as_did(), public_key_multibase(&spacex.did)?);
-    let vantor_doc = did_web_document(vantor_did.as_did(), public_key_multibase(&vantor.did)?);
-
-    write_json(
-        &state.did_cache_dir.join("did-web-spacex.com.json"),
-        &spacex_doc,
-    )?;
-    write_json(
-        &state.did_cache_dir.join("did-web-vantor.com.json"),
-        &vantor_doc,
-    )?;
-
-    let resolver = OfflineDidResolver::new([
-        (
-            spacex_did.to_string(),
-            serde_json::to_vec_pretty(&spacex_doc)?,
-        ),
-        (
-            vantor_did.to_string(),
-            serde_json::to_vec_pretty(&vantor_doc)?,
-        ),
-    ]);
-    let vm_resolver: VerificationMethodDIDResolver<_, AnyMethod> =
-        VerificationMethodDIDResolver::new(resolver);
-    let verification_params = VerificationParameters::from_resolver(&vm_resolver);
-    state.finish_stage(stage, 0);
-
-    // This is a harness calibration stage, not a protocol artifact. QEMU TCG,
-    // JSON-LD expansion, allocator growth, and the BBS+ issuing path all have
-    // first-use costs that would otherwise be hidden inside the first real VC.
-    stage = state.start_stage(
-        "warmup_bbs2023_issue_path",
-        "experiment_harness",
-        "warmup_bbs2023_issue",
-    );
-    let _warmup_vc = issue_roaming_contract(
-        &vm_resolver,
-        &spacex,
-        spacex_did.as_did(),
-        &user.did.to_string(),
-        &user.did.to_string(),
-        &spacex_did,
-        &vantor_did,
-        "000000000001",
-    )
-    .await?;
-    state.finish_stage(stage, 0);
-
-    // Stage 1: User and SpaceX sign a roaming contract.
-    // Artifacts:
-    // - 01-spacex-issued-user-roaming-contract-base-vc.json
-    // - 02-user-issued-spacex-roaming-contract-base-vc.json
-    stage = state.start_stage(
-        "issue_spacex_to_user_roaming_contract",
-        "spacex_operator",
-        "issue_bbs2023_vc",
-    );
-    let spacex_issued_roaming_contract = issue_roaming_contract(
-        &vm_resolver,
-        &spacex,
-        spacex_did.as_did(),
-        &user.did.to_string(),
-        &user.did.to_string(),
-        &spacex_did,
-        &vantor_did,
-        "000000000301",
-    )
-    .await?;
-    let spacex_issued_roaming_path = state
-        .artifact_dir
-        .join("01-spacex-issued-user-roaming-contract-base-vc.json");
-    write_json(&spacex_issued_roaming_path, &spacex_issued_roaming_contract)?;
-    state.finish_stage(stage, file_len(&spacex_issued_roaming_path)?);
-
-    stage = state.start_stage(
-        "issue_user_to_spacex_roaming_contract",
-        "user_terminal",
-        "issue_bbs2023_vc",
-    );
-    let user_issued_roaming_contract = issue_roaming_contract(
-        &vm_resolver,
-        &user_issuer,
-        user_issuer.did.as_did(),
-        &spacex_did.to_string(),
-        &user.did.to_string(),
-        &spacex_did,
-        &vantor_did,
-        "000000000302",
-    )
-    .await?;
-    let user_issued_roaming_path = state
-        .artifact_dir
-        .join("02-user-issued-spacex-roaming-contract-base-vc.json");
-    write_json(&user_issued_roaming_path, &user_issued_roaming_contract)?;
-    state.finish_stage(stage, file_len(&user_issued_roaming_path)?);
-
-    // Stage 2: SpaceX and Vantor sign their cooperation agreement.
-    // Artifacts:
-    // - 03-spacex-issued-vantor-cooperation-agreement-base-vc.json
-    // - 04-vantor-issued-spacex-cooperation-agreement-base-vc.json
-    stage = state.start_stage(
-        "issue_spacex_to_vantor_cooperation",
-        "spacex_operator",
-        "issue_bbs2023_vc",
-    );
-    let spacex_issued_cooperation = issue_cooperation_agreement(
-        &vm_resolver,
-        &spacex,
-        spacex_did.as_did(),
-        &spacex_did,
-        &vantor_did,
-        "000000000101",
-    )
-    .await?;
-    let spacex_issued_cooperation_path = state
-        .artifact_dir
-        .join("03-spacex-issued-vantor-cooperation-agreement-base-vc.json");
-    write_json(&spacex_issued_cooperation_path, &spacex_issued_cooperation)?;
-    state.finish_stage(stage, file_len(&spacex_issued_cooperation_path)?);
-
-    stage = state.start_stage(
-        "issue_vantor_to_spacex_cooperation",
-        "vantor_operator",
-        "issue_bbs2023_vc",
-    );
-    let vantor_issued_cooperation = issue_cooperation_agreement(
-        &vm_resolver,
-        &vantor,
-        vantor_did.as_did(),
-        &vantor_did,
-        &spacex_did,
-        "000000000102",
-    )
-    .await?;
-    let vantor_issued_cooperation_path = state
-        .artifact_dir
-        .join("04-vantor-issued-spacex-cooperation-agreement-base-vc.json");
-    write_json(&vantor_issued_cooperation_path, &vantor_issued_cooperation)?;
-    state.finish_stage(stage, file_len(&vantor_issued_cooperation_path)?);
-
-    // Stage 3: SpaceX and Vantor assign authorization VCs to their LEOs.
-    // The LeoAuth subject includes the cooperation agreement id so each LEO can
-    // later disclose that it operates under the SpaceX/Vantor agreement.
-    // Artifacts:
-    // - 05-spacex-leo-auth-base-vc.json
-    // - 06-vantor-leo-auth-base-vc.json
-    stage = state.start_stage(
-        "assign_spacex_leo_authorization",
-        "spacex_operator",
-        "issue_bbs2023_vc",
-    );
-    let spacex_leo_auth = issue_leo_authorization(
-        &vm_resolver,
-        &spacex,
-        &spacex_did,
-        &spacex_leo,
-        "spacex-leo-0001",
-        "1001",
-    )
-    .await?;
-    let spacex_auth_path = state.artifact_dir.join("05-spacex-leo-auth-base-vc.json");
-    write_json(&spacex_auth_path, &spacex_leo_auth)?;
-    state.finish_stage(stage, file_len(&spacex_auth_path)?);
-
-    stage = state.start_stage(
-        "assign_vantor_leo_authorization",
-        "vantor_operator",
-        "issue_bbs2023_vc",
-    );
-    let vantor_leo_auth = issue_leo_authorization(
-        &vm_resolver,
-        &vantor,
-        &vantor_did,
-        &vantor_leo,
-        "vantor-leo-0001",
-        "2001",
-    )
-    .await?;
-    let vantor_auth_path = state.artifact_dir.join("06-vantor-leo-auth-base-vc.json");
-    write_json(&vantor_auth_path, &vantor_leo_auth)?;
-    state.finish_stage(stage, file_len(&vantor_auth_path)?);
-
-    // Stage 4: User and Starlink LEO mutually present VPs.
-    // User presents one roaming contract as a BBS derived VC inside a signed
-    // VP. Starlink LEO presents its SpaceX LeoAuth as a BBS derived VC inside
-    // a signed VP. The VP signatures prove holder control; the embedded BBS
-    // proofs prove issuer-signed claims with selective disclosure.
-    // Artifacts:
-    // - 07-spacex-issued-user-roaming-contract-derived-vc.json
-    // - 09-user-to-spacex-leo-vp.json
-    // - 10-spacex-leo-auth-derived-vc.json
-    // - 11-spacex-leo-to-user-vp.json
-    stage = state.start_stage(
-        "build_user_to_spacex_leo_vp",
-        "user_terminal",
-        "derive_vc_and_sign_vp",
-    );
-    let (spacex_issued_derived_contract, user_to_spacex_leo_vp) = derive_user_contract_vp(
-        &vm_resolver,
-        &spacex_issued_roaming_contract,
-        &verification_params,
-        &user,
-    )
-    .await?;
-    let spacex_issued_contract_derived_path = state
-        .artifact_dir
-        .join("07-spacex-issued-user-roaming-contract-derived-vc.json");
-    let user_to_spacex_leo_vp_path = state.artifact_dir.join("09-user-to-spacex-leo-vp.json");
-    write_json(
-        &spacex_issued_contract_derived_path,
-        &spacex_issued_derived_contract,
-    )?;
-    write_json(&user_to_spacex_leo_vp_path, &user_to_spacex_leo_vp)?;
-    state.finish_stage(
-        stage,
-        file_len(&spacex_issued_contract_derived_path)? + file_len(&user_to_spacex_leo_vp_path)?,
-    );
-
-    stage = state.start_stage(
-        "build_spacex_leo_to_user_vp",
-        "spacex_leo",
-        "derive_vc_and_sign_vp",
-    );
-    let (spacex_leo_derived_auth, spacex_leo_to_user_vp) = derive_leo_vp(
-        &vm_resolver,
-        &spacex_leo_auth,
-        &verification_params,
-        &spacex_leo,
-        "000000000402",
-    )
-    .await?;
-    let spacex_leo_user_derived_path = state
-        .artifact_dir
-        .join("10-spacex-leo-auth-derived-vc.json");
-    let spacex_leo_to_user_vp_path = state.artifact_dir.join("11-spacex-leo-to-user-vp.json");
-    write_json(&spacex_leo_user_derived_path, &spacex_leo_derived_auth)?;
-    write_json(&spacex_leo_to_user_vp_path, &spacex_leo_to_user_vp)?;
-    state.finish_stage(
-        stage,
-        file_len(&spacex_leo_user_derived_path)? + file_len(&spacex_leo_to_user_vp_path)?,
-    );
-
-    stage = state.start_stage(
-        "verify_at_spacex_leo_user_vp",
-        "spacex_leo",
-        "verify_vp_and_embedded_vc",
-    );
-    let spacex_leo_verifies_user_roaming_vc_proof = spacex_issued_derived_contract
-        .verify(&verification_params)
-        .await?;
-    let spacex_leo_verifies_user_vp = user_to_spacex_leo_vp.verify(&verification_params).await?;
-    assert!(
-        spacex_leo_verifies_user_roaming_vc_proof.is_ok() && spacex_leo_verifies_user_vp.is_ok(),
-        "SpaceX LEO failed to verify User VP"
-    );
-    state.finish_stage(stage, 0);
-
-    stage = state.start_stage(
-        "verify_at_user_spacex_leo_vp",
-        "user_terminal",
-        "verify_vp_and_embedded_vc",
-    );
-    let user_verifies_spacex_leo_auth_vc_proof =
-        spacex_leo_derived_auth.verify(&verification_params).await?;
-    let user_verifies_spacex_leo_vp = spacex_leo_to_user_vp.verify(&verification_params).await?;
-    assert!(
-        user_verifies_spacex_leo_auth_vc_proof.is_ok() && user_verifies_spacex_leo_vp.is_ok(),
-        "User failed to verify SpaceX LEO VP"
-    );
-    state.finish_stage(stage, 0);
-
-    // Stage 5: Starlink LEO and Vantor LEO mutually present VPs.
-    // Each LEO presents exactly one cooperation VC that was issued by the peer
-    // operator. This proves the counterparty recognized the shared
-    // coop-spacex-vantor-2026 agreement without packing extra local credentials
-    // into the VP.
-    stage = state.start_stage(
-        "build_spacex_leo_to_vantor_leo_vp",
-        "spacex_leo",
-        "derive_vc_and_sign_vp",
-    );
-    let vantor_issued_cooperation_derived =
-        derive_cooperation_vc(&vantor_issued_cooperation, &verification_params).await?;
-    let spacex_leo_vp = sign_single_credential_vp(
-        &vm_resolver,
-        &spacex_leo,
-        "000000000501",
-        vantor_issued_cooperation_derived.clone(),
-        "2026-06-01T00:00:04Z",
-    )
-    .await?;
-    let vantor_issued_cooperation_derived_path = state
-        .artifact_dir
-        .join("12-vantor-issued-spacex-cooperation-derived-vc.json");
-    let spacex_leo_vp_path = state
-        .artifact_dir
-        .join("13-spacex-leo-to-vantor-leo-vp.json");
-    write_json(
-        &vantor_issued_cooperation_derived_path,
-        &vantor_issued_cooperation_derived,
-    )?;
-    write_json(&spacex_leo_vp_path, &spacex_leo_vp)?;
-    state.finish_stage(
-        stage,
-        file_len(&vantor_issued_cooperation_derived_path)? + file_len(&spacex_leo_vp_path)?,
-    );
-
-    stage = state.start_stage(
-        "build_vantor_leo_to_spacex_leo_vp",
-        "vantor_leo",
-        "derive_vc_and_sign_vp",
-    );
-    let spacex_issued_cooperation_derived =
-        derive_cooperation_vc(&spacex_issued_cooperation, &verification_params).await?;
-    let vantor_leo_vp = sign_single_credential_vp(
-        &vm_resolver,
-        &vantor_leo,
-        "000000000502",
-        spacex_issued_cooperation_derived.clone(),
-        "2026-06-01T00:00:05Z",
-    )
-    .await?;
-    let spacex_issued_cooperation_derived_path = state
-        .artifact_dir
-        .join("14-spacex-issued-vantor-cooperation-derived-vc.json");
-    let vantor_leo_vp_path = state
-        .artifact_dir
-        .join("15-vantor-leo-to-spacex-leo-vp.json");
-    write_json(
-        &spacex_issued_cooperation_derived_path,
-        &spacex_issued_cooperation_derived,
-    )?;
-    write_json(&vantor_leo_vp_path, &vantor_leo_vp)?;
-    state.finish_stage(
-        stage,
-        file_len(&spacex_issued_cooperation_derived_path)? + file_len(&vantor_leo_vp_path)?,
-    );
-
-    stage = state.start_stage(
-        "verify_at_spacex_leo_vantor_vp",
-        "spacex_leo",
-        "verify_vp_and_embedded_vc",
-    );
-    let spacex_leo_verifies_vantor_cooperation_vc_proof = spacex_issued_cooperation_derived
-        .verify(&verification_params)
-        .await?;
-    let spacex_peer_vp_verify = vantor_leo_vp.verify(&verification_params).await?;
-    assert!(
-        spacex_leo_verifies_vantor_cooperation_vc_proof.is_ok() && spacex_peer_vp_verify.is_ok(),
-        "SpaceX LEO failed to verify Vantor LEO VP"
-    );
-    state.finish_stage(stage, 0);
-
-    stage = state.start_stage(
-        "verify_at_vantor_leo_spacex_vp",
-        "vantor_leo",
-        "verify_vp_and_embedded_vc",
-    );
-    let vantor_leo_verifies_spacex_cooperation_vc_proof = vantor_issued_cooperation_derived
-        .verify(&verification_params)
-        .await?;
-    let vantor_peer_vp_verify = spacex_leo_vp.verify(&verification_params).await?;
-    assert!(
-        vantor_leo_verifies_spacex_cooperation_vc_proof.is_ok() && vantor_peer_vp_verify.is_ok(),
-        "Vantor LEO failed to verify SpaceX LEO VP"
-    );
-    state.finish_stage(stage, 0);
-
-    stage = state.start_stage(
-        "end_to_end_relay_authorization",
-        "spacex_leo",
-        "make_relay_decision",
-    );
-    let decision = json!({
-        "decision": "allow",
-        "reason": "BBS derived roaming contract verified offline; revocation checks intentionally skipped",
-        "spacexLeo": spacex_leo.did,
-        "vantorLeo": vantor_leo.did,
-        "didWebCache": [
-            "fixtures/did-cache/did-web-spacex.com.json",
-            "fixtures/did-cache/did-web-vantor.com.json"
+    let warmups = aggregate_stage(&raw_samples, WARM_UP_STAGE);
+    let generations = aggregate_stage(&raw_samples, GENERATE_STAGE);
+    let verifications = aggregate_stage(&raw_samples, VERIFY_STAGE);
+    let figure5 = figure_slice(&verifications, "Figure 5");
+    let figure6 = figure_slice(&generations, "Figure 6");
+    let figure7 = figure_slice(&generations, "Figure 7");
+    let summary = Summary {
+        run_id: run_id.clone(),
+        protocol: "BBS+ blind issuance with anonymous holder binding",
+        benchmark_reference: "BBS_SAC2026 Figure 6 and Figure 7 parameter slices",
+        measured_runs_per_condition: MEASURED_RUNS,
+        stages: vec![
+            StageSummary {
+                stage: WARM_UP_STAGE,
+                results: warmups,
+            },
+            StageSummary {
+                stage: GENERATE_STAGE,
+                results: generations,
+            },
+            StageSummary {
+                stage: VERIFY_STAGE,
+                results: verifications,
+            },
         ],
-        "userStarlinkPresentations": [
-            "09-user-to-spacex-leo-vp.json",
-            "11-spacex-leo-to-user-vp.json"
-        ],
-        "mutualLeoPresentations": [
-            "13-spacex-leo-to-vantor-leo-vp.json",
-            "15-vantor-leo-to-spacex-leo-vp.json"
-        ]
-    });
-    let decision_path = state.artifact_dir.join("17-relay-decision.json");
-    write_json(&decision_path, &decision)?;
-    state.finish_stage(stage, file_len(&decision_path)?);
-
-    state.write_summary()?;
-    println!("run_id = {}", state.run_id);
-    println!("results = {}", state.result_dir.display());
-    println!(
-        "metrics = {}",
-        state.result_dir.join("metrics.jsonl").display()
-    );
-    println!(
-        "summary = {}",
-        state.result_dir.join("summary.json").display()
-    );
-
+    };
+    write_json(&result_dir.join("summary.json"), &summary)?;
+    write_json(&result_dir.join("figure5-data.json"), &figure5)?;
+    write_json(&result_dir.join("figure6-data.json"), &figure6)?;
+    write_json(&result_dir.join("figure7-data.json"), &figure7)?;
+    write_json(&result_dir.join("timing-raw.json"), &raw_samples)?;
+    write_json(
+        &result_dir.join("excel-input.json"),
+        &ExcelInput {
+            run_id: &run_id,
+            figure5,
+            figure6,
+            figure7,
+            raw_samples: &raw_samples,
+            summary: &summary,
+        },
+    )?;
+    println!("run_id = {run_id}");
+    println!("results = {}", result_dir.display());
     Ok(())
 }
 
-async fn issue_cooperation_agreement(
-    resolver: &VerificationMethodDIDResolver<OfflineDidResolver, AnyMethod>,
-    issuer: &SubjectKeys,
-    issuer_did: &ssi_dids_core::DID,
-    partner_did: &DIDBuf,
-    subject_did: &DIDBuf,
-    uuid_suffix: &str,
-) -> Result<AnyDataIntegrity<JsonCredential<CooperationAgreementSubject>>, DynError> {
-    issue_bbs_vc(
-        resolver,
-        &issuer.jwk,
-        issuer_did,
-        &format!("urn:uuid:00000000-0000-0000-0000-{uuid_suffix}"),
-        CooperationAgreementSubject {
-            id: subject_did.to_string(),
-            partner: partner_did.to_string(),
-            agreement_id: "coop-spacex-vantor-2026".to_string(),
-            scope: "Cross-constellation LEO relay and roaming".to_string(),
-        },
-        "2026-06-01T00:00:00Z",
-    )
-    .await
-}
-
-async fn issue_leo_authorization(
-    resolver: &VerificationMethodDIDResolver<OfflineDidResolver, AnyMethod>,
-    issuer: &SubjectKeys,
-    issuer_did: &DIDBuf,
-    leo: &SubjectKeys,
-    satellite_id: &str,
-    status_list_index: &str,
-) -> Result<AnyDataIntegrity<JsonCredential<LeoAuthorizationSubject>>, DynError> {
-    issue_bbs_vc(
-        resolver,
-        &issuer.jwk,
-        issuer_did.as_did(),
-        if satellite_id.starts_with("spacex") {
-            "urn:uuid:00000000-0000-0000-0000-000000000201"
-        } else {
-            "urn:uuid:00000000-0000-0000-0000-000000000202"
-        },
-        LeoAuthorizationSubject {
-            id: leo.did.to_string(),
-            operator: issuer_did.to_string(),
-            satellite_id: satellite_id.to_string(),
-            status_list_index: status_list_index.to_string(),
-            cooperation_agreement_id: "coop-spacex-vantor-2026".to_string(),
-            maintenance_window: "2026-06-02T03:00:00Z/2026-06-02T04:00:00Z".to_string(),
-        },
-        "2026-06-01T00:00:00Z",
-    )
-    .await
-}
-
-async fn issue_roaming_contract(
-    resolver: &VerificationMethodDIDResolver<OfflineDidResolver, AnyMethod>,
-    issuer: &SubjectKeys,
-    issuer_did: &ssi_dids_core::DID,
-    subject_id: &str,
-    requester: &str,
-    spacex_did: &DIDBuf,
-    vantor_did: &DIDBuf,
-    uuid_suffix: &str,
-) -> Result<AnyDataIntegrity<JsonCredential<RoamingContractSubject>>, DynError> {
-    issue_bbs_vc(
-        resolver,
-        &issuer.jwk,
-        issuer_did,
-        &format!("urn:uuid:00000000-0000-0000-0000-{uuid_suffix}"),
-        RoamingContractSubject {
-            id: subject_id.to_string(),
-            roaming_contract_id: "roaming-contract-0001".to_string(),
-            requester: requester.to_string(),
-            home_operator: spacex_did.to_string(),
-            visited_operator: vantor_did.to_string(),
-            authorized_for: "Vantor high-resolution imagery relay via SpaceX OISL".to_string(),
-            billing_reference: "billing-private-2026-0001".to_string(),
-            internal_policy: "internal-qos-tier-gold".to_string(),
-        },
-        "2026-06-01T00:00:00Z",
-    )
-    .await
-}
-
-async fn derive_user_contract_vp(
-    resolver: &VerificationMethodDIDResolver<OfflineDidResolver, AnyMethod>,
-    spacex_issued_contract: &AnyDataIntegrity<JsonCredential<RoamingContractSubject>>,
-    verification_params: &VerificationParameters<
-        &VerificationMethodDIDResolver<OfflineDidResolver, AnyMethod>,
-    >,
-    user: &SubjectKeys,
-) -> Result<
-    (
-        AnyDataIntegrity,
-        AnyDataIntegrity<JsonPresentation<AnyDataIntegrity>>,
-    ),
-    DynError,
-> {
-    let spacex_issued_derived: AnyDataIntegrity = serde_json::from_value(serde_json::to_value(
-        &derive_roaming_contract(spacex_issued_contract, verification_params).await?,
-    )?)?;
-    let roaming_vp = sign_single_credential_vp(
-        resolver,
-        user,
-        "000000000401",
-        spacex_issued_derived.clone(),
-        "2026-06-01T00:00:02Z",
-    )
-    .await?;
-
-    Ok((spacex_issued_derived, roaming_vp))
-}
-
-async fn derive_cooperation_vc(
-    cooperation: &AnyDataIntegrity<JsonCredential<CooperationAgreementSubject>>,
-    verification_params: &VerificationParameters<
-        &VerificationMethodDIDResolver<OfflineDidResolver, AnyMethod>,
-    >,
-) -> Result<AnyDataIntegrity, DynError> {
-    let derived = derive_cooperation_agreement(cooperation, verification_params).await?;
-    serde_json::from_value(serde_json::to_value(&derived)?).map_err(Into::into)
-}
-
-async fn derive_leo_vp(
-    resolver: &VerificationMethodDIDResolver<OfflineDidResolver, AnyMethod>,
-    leo_authorization: &AnyDataIntegrity<JsonCredential<LeoAuthorizationSubject>>,
-    verification_params: &VerificationParameters<
-        &VerificationMethodDIDResolver<OfflineDidResolver, AnyMethod>,
-    >,
-    leo: &SubjectKeys,
-    uuid_suffix: &str,
-) -> Result<
-    (
-        AnyDataIntegrity,
-        AnyDataIntegrity<JsonPresentation<AnyDataIntegrity>>,
-    ),
-    DynError,
-> {
-    let derived_auth = derive_leo_authorization(leo_authorization, verification_params).await?;
-    let verifiable_derived_auth: AnyDataIntegrity =
-        serde_json::from_value(serde_json::to_value(&derived_auth)?)?;
-    let vp = sign_single_credential_vp(
-        resolver,
-        leo,
-        uuid_suffix,
-        verifiable_derived_auth.clone(),
-        "2026-06-01T00:00:03Z",
-    )
-    .await?;
-
-    Ok((verifiable_derived_auth, vp))
-}
-
-async fn sign_single_credential_vp(
-    resolver: &VerificationMethodDIDResolver<OfflineDidResolver, AnyMethod>,
-    holder: &SubjectKeys,
-    uuid_suffix: &str,
-    credential: AnyDataIntegrity,
-    proof_created: &str,
-) -> Result<AnyDataIntegrity<JsonPresentation<AnyDataIntegrity>>, DynError> {
-    let vp = JsonPresentation::new(
-        Some(format!("urn:uuid:00000000-0000-0000-0000-{uuid_suffix}").parse()?),
-        vec![holder.did.clone().into_uri().into()],
-        vec![credential],
-    );
-    sign_holder_vp(
-        resolver,
-        &holder.jwk,
-        holder.did.as_did(),
-        vp,
-        proof_created,
-    )
-    .await
-}
-
-impl ExperimentState {
-    fn new() -> Result<Self, DynError> {
-        let run_id = SystemTime::now()
-            .duration_since(UNIX_EPOCH)?
-            .as_secs()
-            .to_string();
-        let result_dir = workspace_path(&[RESULTS_ROOT, &format!("run-{run_id}")]);
-        let artifact_dir = result_dir.join("artifacts");
-        let did_cache_dir = workspace_path(&[DID_CACHE_ROOT]);
-        ensure_dir(&artifact_dir)?;
-        ensure_dir(&did_cache_dir)?;
-        Ok(Self {
-            run_id,
-            result_dir,
-            artifact_dir,
-            did_cache_dir,
-            metrics: Vec::new(),
-            seen_actors: HashSet::new(),
-            process_cold_start_recorded: false,
+fn benchmark_conditions() -> Vec<Condition> {
+    let mut conditions = FIGURE_5_ATTRIBUTE_COUNTS
+        .into_iter()
+        .map(|count| Condition {
+            figure: "Figure 5",
+            attribute_count: count,
+            target_reveal_ratio: FIGURE_5_REVEAL_RATIO,
         })
+        .collect::<Vec<_>>();
+    conditions.extend(
+        FIGURE_6_REVEAL_RATIOS
+            .into_iter()
+            .map(|ratio| Condition {
+                figure: "Figure 6",
+                attribute_count: FIGURE_6_ATTRIBUTE_COUNT,
+                target_reveal_ratio: ratio,
+            })
+            .collect::<Vec<_>>(),
+    );
+    conditions.extend(
+        FIGURE_7_ATTRIBUTE_COUNTS
+            .into_iter()
+            .map(|count| Condition {
+                figure: "Figure 7",
+                attribute_count: count,
+                target_reveal_ratio: FIGURE_7_REVEAL_RATIO,
+            }),
+    );
+    conditions
+}
+
+fn run_condition(condition: &Condition, samples: &mut Vec<RawSample>) -> Result<(), DynError> {
+    let attributes = benchmark_attributes(condition.attribute_count);
+    let reveal_indices =
+        disclosure_indices(condition.attribute_count, condition.target_reveal_ratio);
+    let revealed_count = reveal_indices.len();
+    let effective_ratio = revealed_count as f64 / condition.attribute_count as f64;
+
+    let started = Instant::now();
+    let issuer = Issuer::generate_for_attributes(
+        PARTNER_NCC,
+        "did:web:partner-ncc.com",
+        condition.attribute_count,
+    );
+    let ue = Holder::generate(UE);
+    let credential = blind_issue(&issuer, &ue, CredentialKind::PartnerAccess, &attributes)?;
+    let warmup_request = VerifierRequest::generate(LEO_PARTNER, CredentialKind::PartnerAccess);
+    let warmup_presentation = present(&credential, &ue, &warmup_request, &reveal_indices)?;
+    verify(&warmup_presentation, &warmup_request, &issuer)?;
+    samples.push(sample(
+        condition,
+        revealed_count,
+        effective_ratio,
+        0,
+        WARM_UP_STAGE,
+        started.elapsed().as_secs_f64() * 1000.0,
+        None,
+    ));
+
+    for iteration in 1..=MEASURED_RUNS {
+        let request = VerifierRequest::generate(LEO_PARTNER, CredentialKind::PartnerAccess);
+        let generation_started = Instant::now();
+        let presentation = present(&credential, &ue, &request, &reveal_indices)?;
+        let generation_ms = generation_started.elapsed().as_secs_f64() * 1000.0;
+        let vp_payload_bytes = serde_json::to_vec(&presentation)?.len() as u64;
+        samples.push(sample(
+            condition,
+            revealed_count,
+            effective_ratio,
+            iteration,
+            GENERATE_STAGE,
+            generation_ms,
+            Some(vp_payload_bytes),
+        ));
+
+        let verification_started = Instant::now();
+        verify(&presentation, &request, &issuer)?;
+        samples.push(sample(
+            condition,
+            revealed_count,
+            effective_ratio,
+            iteration,
+            VERIFY_STAGE,
+            verification_started.elapsed().as_secs_f64() * 1000.0,
+            Some(vp_payload_bytes),
+        ));
     }
+    Ok(())
+}
 
-    fn start_stage(
-        &mut self,
-        stage: &'static str,
-        actor: &'static str,
-        operation: &'static str,
-    ) -> StageTimer {
-        let includes_process_cold_start = !self.process_cold_start_recorded;
-        self.process_cold_start_recorded = true;
+fn benchmark_attributes(count: usize) -> Vec<SubjectAttribute> {
+    (1..=count)
+        .map(|index| SubjectAttribute {
+            name: format!("attr_{index:02}"),
+            // Attribute names are schema-defined and are not repeated in a VP.
+            // Fixed eight-character values prevent value length from dominating the
+            // Figure 6/7 payload comparison.
+            value: format!("v{index:07}"),
+        })
+        .collect()
+}
 
-        let includes_actor_cold_start = self.seen_actors.insert(actor);
-        StageTimer::start_for(
-            stage,
-            actor,
-            operation,
-            includes_process_cold_start,
-            includes_actor_cold_start,
-        )
+fn disclosure_indices(attribute_count: usize, target_ratio: f64) -> Vec<usize> {
+    let reveal_count =
+        ((attribute_count as f64 * target_ratio).round() as usize).min(attribute_count);
+    (0..reveal_count).collect()
+}
+
+fn sample(
+    condition: &Condition,
+    revealed_count: usize,
+    effective_ratio: f64,
+    iteration: usize,
+    stage: &str,
+    wall_time_ms: f64,
+    vp_payload_bytes: Option<u64>,
+) -> RawSample {
+    RawSample {
+        figure: condition.figure.to_string(),
+        attribute_count: condition.attribute_count,
+        target_reveal_ratio: condition.target_reveal_ratio,
+        revealed_attribute_count: revealed_count,
+        effective_reveal_ratio: effective_ratio,
+        iteration,
+        stage: stage.to_string(),
+        wall_time_ms,
+        vp_payload_bytes,
     }
+}
 
-    fn finish_stage(&mut self, timer: StageTimer, artifact_bytes: u64) {
-        let metric = timer.finish(artifact_bytes);
-        println!("{:<32} {:>10.3} ms", metric.stage, metric.wall_time_ms);
-        self.metrics.push(metric);
-    }
+fn aggregate_stage(samples: &[RawSample], stage: &str) -> Vec<Aggregate> {
+    benchmark_conditions()
+        .into_iter()
+        .map(|condition| {
+            let group = samples
+                .iter()
+                .filter(|sample| {
+                    sample.stage == stage
+                        && sample.figure == condition.figure
+                        && sample.attribute_count == condition.attribute_count
+                        && sample.target_reveal_ratio == condition.target_reveal_ratio
+                })
+                .collect::<Vec<_>>();
+            let mut timings = group
+                .iter()
+                .map(|sample| sample.wall_time_ms)
+                .collect::<Vec<_>>();
+            timings.sort_by(f64::total_cmp);
+            let payloads = group
+                .iter()
+                .filter_map(|sample| sample.vp_payload_bytes)
+                .map(|bytes| bytes as f64)
+                .collect::<Vec<_>>();
+            Aggregate {
+                figure: condition.figure.to_string(),
+                attribute_count: condition.attribute_count,
+                target_reveal_ratio: condition.target_reveal_ratio,
+                revealed_attribute_count: group[0].revealed_attribute_count,
+                effective_reveal_ratio: group[0].effective_reveal_ratio,
+                measured_runs: group.len(),
+                mean_time_ms: mean(&timings),
+                p50_time_ms: percentile(&timings, 0.50),
+                p95_time_ms: percentile(&timings, 0.95),
+                mean_vp_payload_bytes: (!payloads.is_empty()).then(|| mean(&payloads)),
+            }
+        })
+        .collect()
+}
 
-    fn write_summary(&self) -> Result<(), DynError> {
-        let metrics_path = self.result_dir.join("metrics.jsonl");
-        let mut metrics_jsonl = String::new();
-        for metric in &self.metrics {
-            metrics_jsonl.push_str(&serde_json::to_string(metric)?);
-            metrics_jsonl.push('\n');
-        }
-        write_text(&metrics_path, &metrics_jsonl)?;
-
-        let summary = ExperimentSummary {
-            run_id: self.run_id.clone(),
-            qemu_profile: qemu_profile(),
-            metrics: self.metrics.clone(),
-        };
-        write_json(&self.result_dir.join("summary.json"), &summary)
-    }
+fn figure_slice(values: &[Aggregate], figure: &str) -> Vec<Aggregate> {
+    values
+        .iter()
+        .filter(|value| value.figure == figure)
+        .cloned()
+        .collect()
+}
+fn mean(values: &[f64]) -> f64 {
+    values.iter().sum::<f64>() / values.len() as f64
+}
+fn percentile(values: &[f64], ratio: f64) -> f64 {
+    values[((values.len() - 1) as f64 * ratio).round() as usize]
 }

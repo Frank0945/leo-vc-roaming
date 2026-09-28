@@ -1,0 +1,74 @@
+[
+  {
+    "figure": "Figure 5",
+    "attributeCount": 5,
+    "targetRevealRatio": 0.8,
+    "revealedAttributeCount": 4,
+    "effectiveRevealRatio": 0.8,
+    "measuredRuns": 50,
+    "meanTimeMs": 24.93613656,
+    "p50TimeMs": 24.858477,
+    "p95TimeMs": 26.386685,
+    "meanVpPayloadBytes": 936.0
+  },
+  {
+    "figure": "Figure 5",
+    "attributeCount": 6,
+    "targetRevealRatio": 0.8,
+    "revealedAttributeCount": 5,
+    "effectiveRevealRatio": 0.8333333333333334,
+    "measuredRuns": 50,
+    "meanTimeMs": 25.563567560000003,
+    "p50TimeMs": 25.190673,
+    "p95TimeMs": 27.065927,
+    "meanVpPayloadBytes": 951.0
+  },
+  {
+    "figure": "Figure 5",
+    "attributeCount": 7,
+    "targetRevealRatio": 0.8,
+    "revealedAttributeCount": 6,
+    "effectiveRevealRatio": 0.8571428571428571,
+    "measuredRuns": 50,
+    "meanTimeMs": 25.368919499999997,
+    "p50TimeMs": 25.390932000000003,
+    "p95TimeMs": 27.191842,
+    "meanVpPayloadBytes": 966.0
+  },
+  {
+    "figure": "Figure 5",
+    "attributeCount": 8,
+    "targetRevealRatio": 0.8,
+    "revealedAttributeCount": 6,
+    "effectiveRevealRatio": 0.75,
+    "measuredRuns": 50,
+    "meanTimeMs": 25.774858079999998,
+    "p50TimeMs": 25.77034,
+    "p95TimeMs": 27.815512000000002,
+    "meanVpPayloadBytes": 1008.0
+  },
+  {
+    "figure": "Figure 5",
+    "attributeCount": 9,
+    "targetRevealRatio": 0.8,
+    "revealedAttributeCount": 7,
+    "effectiveRevealRatio": 0.7777777777777778,
+    "measuredRuns": 50,
+    "meanTimeMs": 26.0660832,
+    "p50TimeMs": 26.066374,
+    "p95TimeMs": 28.426972,
+    "meanVpPayloadBytes": 1023.0
+  },
+  {
+    "figure": "Figure 5",
+    "attributeCount": 10,
+    "targetRevealRatio": 0.8,
+    "revealedAttributeCount": 8,
+    "effectiveRevealRatio": 0.8,
+    "measuredRuns": 50,
+    "meanTimeMs": 26.11728096,
+    "p50TimeMs": 26.18971,
+    "p95TimeMs": 28.679684,
+    "meanVpPayloadBytes": 1039.0
+  }
+]

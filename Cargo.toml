@@ -4,20 +4,17 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-ssi = { version = "0.16", features = ["bbs"] }
-
-did-method-key = { version = "0.5", features = ["bbs"] }
-ssi-claims = { version = "0.7", features = ["bbs"] }
-ssi-data-integrity = { version = "0.4", features = ["bbs"] }
-ssi-dids-core = "0.3"
-ssi-jwk = { version = "0.4", features = ["bbs"] }
-ssi-verification-methods = "0.3"
-ssi-verification-methods-core = { version = "0.3", features = ["bbs"] }
-ssi-json-ld = "0.3"
-
 async-std = { version = "1.12", features = ["attributes"] }
+ark-bls12-381 = { version = "0.4", features = ["curve"] }
+ark-ff = "0.4"
+ark-serialize = "0.4"
+base64 = "0.22"
+bbs_plus = "0.25"
+dock_crypto_utils = "0.23"
+libc = "0.2"
+rand = "0.8"
+schnorr_pok = "0.23"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-static-iref = "3"
-iref = "3"
-libc = "0.2"
+sha2 = "0.10"
+thiserror = "2"
